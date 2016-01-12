@@ -3,15 +3,15 @@
 
 
 """
-    \file mendeley2bibtex.py
+    \file mendeley2biblatex.py
+	\author Peter Rosina, University of Augsburg - rosina@ds-lab.org
+	\date 2014.10
     \author François Bianco, University of Geneva – francois.bianco@unige.ch
     \date 2012.09
 
+    \mainpage Mendeley To BibLaTeX convertor
 
-    \mainpage Mendeley To BibTeX convertor
-
-    This script converts Mendeley SQlite database to BibTeX file.
-
+    This script converts Mendeley SQlite database to BibLaTeX file.
 
     \section Infos
 
@@ -20,15 +20,16 @@
 database to BibTeX not provided by the closed source Mendeley Desktop software.
 
     First locate your database. On Linux systems it is:
-    
-ls ~/.local/share/data/Mendeley\ Ltd./Mendeley\
-Desktop/your@email.com@www.mendeley.com.sqlite
+ls ~/.local/share/data/Mendeley\ Ltd./Mendeley\ Desktop/your@email.com@www.mendeley.com.sqlite
+
+    On Windows it is:
+    C:\\Users\\Username\\AppData\\Local\\Mendeley\ Ltd\\Mendeley\ Desktop\\your@email.com@www.mendeley.com.sqlite
 
     Make a copy of this file, as we assume no responsability for loss of data.
 
     Then run mendeley2bibtex.py on your file with
 
-        ./mendeley2bibtex.py -o mendeley.bib mendeley.sqlite
+        ./mendeley2bibtex.py -f foldername -o mendeley.bib mendeley.sqlite
 
 
     \section Copyright
@@ -55,6 +56,9 @@ francois.bianco@unige.ch
 
     2012.09:
         First Version
+    2014.10:
+        Second Version
+
 
 """
 
@@ -64,72 +68,6 @@ import sqlite3
 import re
 
 version = '0.01'
-
-def clean_char(entry):
-    """A helper function to convert special characters to LaTeX characters"""
-
-    # List of char and replacement, add your own list below
-    char_to_replace = {
-        # LaTeX special char
-        '&':'\&',
-        # UTF8 not understood by inputenc
-        u'–':'--', # utf8 2014, special dash
-        u'—':'--', # utf8 2013, special dash
-        u'∕':'/',  # utf8 2215, math division
-        u'κ':'k', # Greek kappa
-        u'×':'x', # times
-        }
-
-    # Which field shall we check and convert
-    entry_key=['publisher','publication','title']
-
-    for k in entry_key:
-        for char, repl_char in char_to_replace.iteritems():
-            entry[k] = entry[k].replace(char,repl_char)
-
-#from string import capwords
-def capwords(s):
-    """Reimplement a custom capitalize word function which keeps words
-unchanged except the first letter (useful for chemical compounds and
-special abreviation with capital letter within the word) and which capitalizes
-both words of hyphenated words."""
-
-    for sep in (' ', '-'):
-       s = sep.join( x[0].capitalize()+x[1:] \
-                for x in s.split(sep) if x )
-
-    ## Expanded version for tests/debugging ;-)
-    #for sep in (' ', '-'):
-        #new_w = []
-        #for w in s.split(sep):
-            #if not w:
-                #continue
-            #new_w.append( w[0].capitalize()+w[1:] )
-        #s = sep.join(new_w)
-    return s
-
-def capitalize_title(entry):
-    """Helper function to convert paper title to camel case text, according
-    to ACS format : no capital on article and prepositions, hyphenated text
-have both words capitalized (except for verbs).
-
-    BUG : Even hyphenated verbs are capitalized in this version.
-          No possibility to distinguished between As for arsenic and the article
-          Or In for indium or in(side)
-
-    """
-
-    title = capwords(entry['title'])
-
-    word_not_captitalized = ['of','an','on','at', 'to', 'for', 'from', 'in','as',
-                             'by','a','with','and','the','in'] # ,'as'
-    for w in word_not_captitalized:
-        title = title.replace(' '+w.capitalize()+' ',' '+w+' ')
-        title = title.replace('-'+w.capitalize()+'-','-'+w+'-')
-
-    title = title.replace('as Atomic', 'As Atomic')
-    entry['title'] = title
-
 
 def dict_factory(cursor, row):
     """A function to use the SQLite row as dict for string formatting"""
@@ -141,7 +79,43 @@ def dict_factory(cursor, row):
             d[col[0]] = ''
     return d
 
-def convert(db_name, bibtex_file=sys.stdout, quiet=False):
+def addContributors(db, entry, dbRole, role):
+    c = db.cursor()
+    c.execute('''
+    SELECT lastName, firstNames
+    FROM DocumentContributors
+    WHERE documentId = ?
+    AND contribution = "'''+dbRole+'''"
+    ORDER BY id''', (entry['id'],))
+    contributors_list = c.fetchall()
+    contributors = []
+    for contributor in contributors_list:
+        #check for firstname
+        if contributor[1]:
+            contributors.append(', '.join(contributor))
+        #else it is an organization, hence omit comma
+        else:
+            contributors.append('{'+contributor[0]+'}')
+    entry[role] = ' and '.join(contributors)
+
+def addAddress(entry):
+    address = []
+    if entry['city']:
+        address.append(entry['city'])
+    if entry['country']:
+        address.append(entry['country'])
+    entry['address'] = ', '.join(address)
+
+def getFolderQuery(mendeley_folder):
+    '''returns all relevant subfolder ids'''
+    if not mendeley_folder:
+        return '''in_folder_set(id) AS ( SELECT id FROM Folders )'''
+    return '''parent_of(id, parentId) AS ( SELECT id, parentId FROM Folders ),
+        in_folder_set(parentId) AS ( SELECT id from Folders WHERE name="{}"
+            UNION ALL
+            SELECT id FROM parent_of JOIN in_folder_set USING (parentId) )'''.format(mendeley_folder)
+
+def convert(db_name, bibtex_file=sys.stdout, quiet=False, mendeley_folder=""):
     """Converts Mendely SQlite database to BibTeX file
     @param db_name The Mendeley SQlite file
     @param bibtex_file The BibTeX file to output the bibliography, if not
@@ -158,104 +132,127 @@ supplied the output is written to the system standard stdout.
                                  # unicode keys.
                                  
     if sys.stdout != bibtex_file:
-        f = open(bibtex_file,'w')
-        f.write("""This file was generated automatically by Mendeley To
-BibTeX python script.\n\n""")
+        f = open(bibtex_file,'wb')
+        #f.write(("""This file was generated automatically by Mendeley To BibTeX python script.\n\n""").encode())
     else:
         f = bibtex_file
-
-    for entry in c.execute('''
+        
+    query = '''WITH RECURSIVE
+    {}
     SELECT
         D.id,
+        D.chapter,
         D.citationKey,
+        D.city,
+        D.country,
+        D.day,
+        D.doi,
+        D.dateAccessed,
+        D.deletionPending,
+        D.edition,
+        D.institution,
+        D.isbn,
+        D.issn,
+        D.issue,
+        D.medium,
+        D.month,
+        D.note,
+        D.pages,
+        D.publication,
+        D.publisher,
+        D.seriesEditor,
+        D.series,
+        D.sourceType,
         D.title,
         D.type,
-        D.doi,
-        D.publisher,
-        D.publication,
         D.volume,
-        D.issue,
-        D.month,
         D.year,
-        D.pages,
-        F.localUrl
+        DU.url
     FROM Documents D
     LEFT JOIN DocumentCanonicalIds DCI
         ON D.id = DCI.documentId
-    LEFT JOIN DocumentFiles DF
+    LEFT JOIN DocumentUrls DU
+        ON D.id = DU.documentId
+    LEFT JOIN DocumentFolders DF
         ON D.id = DF.documentId
-    LEFT JOIN Files F
-        ON F.hash = DF.hash
-    WHERE D.confirmed = "true"
+    WHERE D.confirmed = "true" AND
+    D.deletionPending = "false" AND
+    DF.folderID IN in_folder_set
     GROUP BY D.citationKey
     ORDER BY D.citationKey
-    ;'''):
+    ;'''.format(getFolderQuery(mendeley_folder))
+    
+    citationTypes = {'JournalArticle' : 'article',
+        'ConferenceProceedings' : 'inproceedings',
+        'Book' : 'book',
+        'BookSection' : 'incollection',
+        'Thesis' : 'thesis',
+        'Generic' : 'misc',
+		'Hearing' : 'misc',
+        'WebPage' : 'online',
+        'Report' : 'report',
+        'Bill' : 'misc',
+        'MagazineArticle' : 'article',
+        'EncyclopediaArticle' : 'inreference',
+        'Patent' : 'patent',
+        'WorkingPaper' : 'report'
+    }
 
-        c2 = db.cursor()
-        c2.execute('''
-    SELECT lastName, firstNames
-    FROM DocumentContributors
-    WHERE documentId = ?
-    ORDER BY id''', (entry['id'],))
-        authors_list = c2.fetchall()
-        authors = []
-        for author in authors_list:
-            authors.append(', '.join(author))
-        entry['authors'] = ' and '.join(authors)
+    replaceAttributes = {'address' : 'address',
+        'author' : 'authors',
+        'booktitle' : 'publication',
+        'chapter' : 'chapter',
+        'urldate' : 'dateAccessed',
+        'day' : 'day',
+        'doi' : 'doi',
+        'editor' : 'editor',
+        'howpublished' : 'medium',
+        'institution' : 'institution',
+        'isbn' : 'isbn',
+        'issn' : 'issn',
+        'issue' : 'issue',
+        'journaltitle' : 'publication',
+        'month' : 'month',
+        #'note' : 'note',
+        #'number' : 'issue', #mendeley does not differentiate between number and issue
+        'organization' : 'institution',
+        'pages' : 'pages',
+        'publisher' : 'publisher',
+        'series' : 'series',
+        'title' : 'title',
+        'url' : 'url',
+        'volume' : 'volume',
+        'year' : 'year'
+    }
+    
+    for entry in c.execute(query):
+        entries = [] 
+        addContributors(db,entry, "DocumentAuthor","authors")
+        addContributors(db,entry, "DocumentEditor","editor")
+        addAddress(entry)
 
-        #capitalize_title(entry)
-        clean_char(entry)
+        for attributeBibLatex,attributeMendeley in replaceAttributes.items():
+            if entry[attributeMendeley]:
+                escapedValue = entry[attributeMendeley]
+                if isinstance(escapedValue, str) or attributeBibLatex == "url":
+                    if not attributeBibLatex == "url":
+                        escapedValue = escapedValue.replace(u"~", "$\sim$")
+                        escapedValue = escapedValue.replace("\\&","&").replace("&","\\&")  #escape & and not \&
+                    else:
+                        if isinstance(escapedValue, bytes):
+                            escapedValue = escapedValue.decode("utf-8")                
+                    entries.append(u'''    {key} = "{value}"'''.format(key=attributeBibLatex, value=escapedValue))
+                else:
+                    entries.append(u'''    {key} = {{{value}}}'''.format(key=attributeBibLatex, value=escapedValue))
 
-        # If you need to add more templates:
-        #    all types of templates are available at
-        #    http://www.cs.vassar.edu/people/priestdo/tips/bibtex
-        if "JournalArticle" == entry['type']:
-            formatted_entry = u'''
-@article{{{entry[citationKey]},
-    author    = "{entry[authors]}",
-    title     = "{entry[title]}",
-    journal   = "{entry[publication]}",
-    number    = "{entry[issue]}",
-    volume    = "{entry[volume]}",
-    pages     = "{entry[pages]}",
-    year      = "{entry[year]}",
-    doi       = "{entry[doi]}",
-    localfile = "{entry[localUrl]}"
-}}'''.format(entry=entry)
-
-
-        elif "ConferenceProceedings" == entry['type']:
-            formatted_entry = u'''
-@proceedings{{{entry[citationKey]},
-    author    = "{entry[authors]}",
-    title     = "{entry[title]}",
-    publisher = "{entry[publisher]}",
-    pages     = "{entry[pages]}",
-    year      = "{entry[year]}",
-    doi       = "{entry[doi]}",
-    localfile = "{entry[localUrl]}"
-}}'''.format(entry=entry)
-
-
-        elif "Book" == entry['type']:
-            formatted_entry = u'''
-@book{{{entry[citationKey]},
-    author    = "{entry[authors]}",
-    title     = "{entry[title]}",
-    publisher = "{entry[publisher]}",
-    year      = "{entry[year]}",
-    volume    = "{entry[volume]}",
-    doi       = "{entry[doi]}",
-    localfile = "{entry[localUrl]}"
-}}'''.format(entry=entry)
-
-        else:
+        formatted_entry = u''
+        try:
+            formatted_entry = u'''\n@{entrytype}{{{citationKey},\n'''.format(entrytype=citationTypes[entry['type']], citationKey=entry['citationKey'])+''',\n'''.join(entries)+'''\n}'''
+        except KeyError:
             if not quiet:
-                print u'''Unhandled entry type {0}, please add your own
-template.'''.format(entry['type'])
-            continue
-        
-        f.write(formatted_entry.encode("UTF-8"))
+                print (u'''Unhandled entry type {0}, please add your own template.'''.format(entry['type']))
+
+        f.write(formatted_entry.encode('utf-8'))
 
     if sys.stdout != bibtex_file:
         f.close()
@@ -266,14 +263,15 @@ def main() :
 
     global version
 
-    parser = OptionParser(usage='''
-  usage: %prog [-o out.bib] mendeley.sqlite''',version='%prog '+version)
+    parser = OptionParser(usage='''%prog [-f foldername -o out.bib] mendeley.sqlite.\n\nAttention: Script ignores "Unsorted", "deletionPending" (in trash) and unconfirmed entries.''' ,version='%prog '+version)
 
     parser.add_option('-q', '--quiet', action='store_true', default=False,
                 dest='quiet', help='Do not display information.')
     parser.add_option("-o", "--output", dest="bibtex_file", default=sys.stdout,
-                help="BibTeX file name, else output will be printed to stdout")
-
+                help="BibTeX file name, else output will be printed to stdout.")
+    parser.add_option("-f", "--folder", dest="mendeley_folder", default="",
+                help="Mendeley folder name, else whole sorted DB will be used.")
+    
     (options, args) = parser.parse_args()
 
     if not args :
@@ -281,11 +279,10 @@ def main() :
 
     db_name = args
 
-    convert(db_name[0], options.bibtex_file, options.quiet)
-
+    convert(db_name[0], options.bibtex_file, options.quiet, options.mendeley_folder)
 
 if __name__ == "__main__":
     try :
         main()
     except (KeyboardInterrupt) :
-        print "Interrupted by user."
+        print ("Interrupted by user.")
